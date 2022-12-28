@@ -2,16 +2,16 @@
 
 use super::TaskContext;
 use super::{pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT};
+use crate::fs::{File, Stdin, Stdout};
+use crate::mm::translated_refmut;
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use crate::fs::{File, Stdin, Stdout};
-use alloc::string::String;
-use crate::mm::translated_refmut;
 
 /// Task control block structure
 ///
@@ -49,7 +49,31 @@ pub struct TaskControlBlockInner {
     pub children: Vec<Arc<TaskControlBlock>>,
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
+
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+
+    pub addtion_info: TaskControlBlockAddtionInfo,
+
+    // prio
+    pub priority: Priority,
+}
+
+pub struct TaskControlBlockAddtionInfo {
+    pub time: usize,
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
+}
+
+impl TaskControlBlockAddtionInfo {
+    fn new() -> TaskControlBlockAddtionInfo {
+        Self {
+            time: 0,
+            syscall_times: [0; MAX_SYSCALL_NUM],
+        }
+    }
+
+    pub fn update_syscall_times(&mut self, syscall_id: usize) {
+        self.syscall_times[syscall_id] += 1;
+    }
 }
 
 /// Simple access to its internal fields
@@ -72,8 +96,7 @@ impl TaskControlBlockInner {
         self.get_status() == TaskStatus::Zombie
     }
     pub fn alloc_fd(&mut self) -> usize {
-        if let Some(fd) = (0..self.fd_table.len())
-            .find(|fd| self.fd_table[*fd].is_none()) {
+        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             fd
         } else {
             self.fd_table.push(None);
@@ -124,6 +147,8 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    addtion_info: TaskControlBlockAddtionInfo::new(),
+                    priority: Priority::new(),
                 })
             },
         };
@@ -200,6 +225,8 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    addtion_info: TaskControlBlockAddtionInfo::new(),
+                    priority: Priority::new(),
                 })
             },
         });
@@ -219,6 +246,66 @@ impl TaskControlBlock {
     }
 }
 
+impl TaskControlBlock {
+    /// spawn from parent to child
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+        // memory_set with elf program headers/trampoline/trap context/user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT).into())
+            .unwrap()
+            .ppn();
+
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = KernelStack::new(&pid_handle);
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: parent_inner.base_size,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: alloc::vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                    addtion_info: TaskControlBlockAddtionInfo::new(),
+                    priority: Priority::new(),
+                })
+            },
+        });
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        // prepare TrapContext in user space
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        // return
+        task_control_block
+        // ---- release parent PCB automatically
+        // **** release children PCB automatically
+    }
+}
+
 #[derive(Copy, Clone, PartialEq)]
 /// task status: UnInit, Ready, Running, Exited
 pub enum TaskStatus {
@@ -226,4 +313,76 @@ pub enum TaskStatus {
     Ready,
     Running,
     Zombie,
+}
+
+pub const BIG_STRIDE: u64 = 0x1111_1111;
+pub const PRIORITY: usize = 16;
+
+#[derive(Debug)]
+pub struct Priority {
+    stride: u64,
+    pass: u64,
+}
+
+impl Priority {
+    fn new() -> Priority {
+        let pass = BIG_STRIDE / PRIORITY as u64;
+
+        Priority {
+            stride: 0,
+            pass: pass,
+        }
+    }
+
+    pub fn set_prio(&mut self, prio: usize) {
+        self.pass = BIG_STRIDE / prio as u64;
+    }
+
+    pub fn update(&mut self) {
+        self.stride += self.pass;
+    }
+}
+
+impl PartialEq for Priority {
+    fn eq(&self, other: &Self) -> bool {
+        self.stride == other.stride
+    }
+}
+
+impl Eq for Priority {}
+
+impl PartialOrd for Priority {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        other.stride.partial_cmp(&self.stride)
+    }
+}
+
+impl Ord for Priority {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        other.stride.cmp(&self.stride)
+    }
+}
+
+impl PartialEq for TaskControlBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner_exclusive_access().priority == other.inner_exclusive_access().priority
+    }
+}
+
+impl Eq for TaskControlBlock {}
+
+impl PartialOrd for TaskControlBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.inner_exclusive_access()
+            .priority
+            .partial_cmp(&other.inner_exclusive_access().priority)
+    }
+}
+
+impl Ord for TaskControlBlock {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.inner_exclusive_access()
+            .priority
+            .cmp(&other.inner_exclusive_access().priority)
+    }
 }

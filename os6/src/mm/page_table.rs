@@ -2,8 +2,8 @@
 
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
+use alloc::{format, vec};
 use bitflags::*;
 
 bitflags! {
@@ -144,6 +144,32 @@ impl PageTable {
     }
 }
 
+/// map/unmap
+impl PageTable {
+    pub fn map_result(
+        &mut self,
+        vpn: VirtPageNum,
+        ppn: PhysPageNum,
+        flags: PTEFlags,
+    ) -> Result<(), String> {
+        let pte = self.find_pte_create(vpn).unwrap();
+        if pte.is_valid() {
+            return Err(format!("vpn {:?} is mapped before mapping", vpn));
+        }
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        Ok(())
+    }
+
+    pub fn unmap_result(&mut self, vpn: VirtPageNum) -> Result<(), String> {
+        let pte = self.find_pte_create(vpn).unwrap();
+        if !pte.is_valid() {
+            return Err(format!("vpn {:?} is invalid before unmapping", vpn));
+        }
+        *pte = PageTableEntry::empty();
+        Ok(())
+    }
+}
+
 /// translate a pointer to a mutable u8 Vec through page table
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
     let page_table = PageTable::from_token(token);
@@ -188,7 +214,10 @@ pub fn translated_str(token: usize, ptr: *const u8) -> String {
 
 pub fn translated_ref<T>(token: usize, ptr: *const T) -> &'static T {
     let page_table = PageTable::from_token(token);
-    page_table.translate_va(VirtAddr::from(ptr as usize)).unwrap().get_mut()
+    page_table
+        .translate_va(VirtAddr::from(ptr as usize))
+        .unwrap()
+        .get_mut()
 }
 
 pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {

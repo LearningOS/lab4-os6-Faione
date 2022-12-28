@@ -17,16 +17,13 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::fs::{open_file, OpenFlags};
+pub use crate::syscall::process::TaskInfo;
+use crate::timer::get_time_us;
 use alloc::sync::Arc;
 use lazy_static::*;
 use manager::fetch_task;
 use switch::__switch;
-use crate::mm::VirtAddr;
-use crate::mm::MapPermission;
-use crate::config::PAGE_SIZE;
-use crate::timer::get_time_us;
-pub use crate::syscall::process::TaskInfo;
-use crate::fs::{open_file, OpenFlags};
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
@@ -45,6 +42,7 @@ pub fn suspend_current_and_run_next() {
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
     // Change status to Ready
+    task_inner.priority.update();
     task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
     // ---- release current PCB
@@ -63,6 +61,7 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     let mut inner = task.inner_exclusive_access();
     // Change status to Zombie
     inner.task_status = TaskStatus::Zombie;
+    inner.addtion_info.time = get_time_us() - inner.addtion_info.time;
     // Record exit code
     inner.exit_code = exit_code;
     // do not move to its parent but under initproc

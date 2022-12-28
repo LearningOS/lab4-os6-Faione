@@ -6,7 +6,6 @@
 //!
 //! Every task or process has a memory_set to control its virtual memory.
 
-
 mod address;
 mod frame_allocator;
 mod heap_allocator;
@@ -15,15 +14,38 @@ mod page_table;
 
 pub use address::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 pub use address::{StepByOne, VPNRange};
+use alloc::string::String;
 pub use frame_allocator::{frame_alloc, frame_dealloc, FrameTracker};
-pub use memory_set::{remap_test, kernel_token};
+pub use memory_set::{kernel_token, remap_test};
 pub use memory_set::{MapPermission, MemorySet, KERNEL_SPACE};
-pub use page_table::{translated_byte_buffer, translated_refmut, translated_ref, translated_str, PageTableEntry};
+pub use page_table::{
+    translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTableEntry,
+};
 pub use page_table::{PTEFlags, PageTable, UserBuffer};
+
+use crate::task::current_task;
 
 /// initiate heap allocator, frame allocator and kernel space
 pub fn init() {
     heap_allocator::init_heap();
     frame_allocator::init_frame_allocator();
     KERNEL_SPACE.exclusive_access().activate();
+}
+
+pub fn memeory_map(
+    start_va: VirtAddr,
+    end_va: VirtAddr,
+    map_perm: MapPermission,
+) -> Result<(), String> {
+    let current_task = current_task().unwrap();
+    let mut inner = current_task.inner_exclusive_access();
+    inner
+        .memory_set
+        .insert_framed_area_result(start_va, end_va, map_perm)
+}
+
+pub fn memeory_unmap(start_va: VirtAddr, end_va: VirtAddr) -> Result<(), String> {
+    let current_task = current_task().unwrap();
+    let mut inner = current_task.inner_exclusive_access();
+    inner.memory_set.remove_area_result(start_va, end_va)
 }
